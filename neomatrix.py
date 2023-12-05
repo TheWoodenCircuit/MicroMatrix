@@ -4,7 +4,7 @@ import time
 import math
 
 default_color = 'white'
-default_brightness = 1  
+default_brightness = 1.0  
 
 colors = {
      'red':    (255, 0, 0),
@@ -18,18 +18,14 @@ colors = {
      'black':  (0, 0, 0)
 }
 
-class Boundary:
-    TOP = 1
-    BOTTOM = 2
-    LEFT = 3
-    RIGHT = 4
-
 def hex_to_rgb(hex):
     return tuple(int(hex[i:i+2], 16) for i in (0, 2, 4))
 
 def get_color_tuple(val):
     if isinstance(val, str):
         val = val.lower()
+        if val == "":
+            return None
         if colors.get(val) is not None:
             return colors.get(val)
         return hex_to_rgb(val)
@@ -54,10 +50,15 @@ class Object:
         self.brightness = brightness
         self.pixels = []
         self.visible = True
-        self.max_x = None
-        self.max_y = None
-        self.min_x = None
-        self.min_y = None
+        self.max_x = -1
+        self.max_y = -1
+        self.min_x = -1
+        self.min_y = -1
+        self.canvas = None
+
+    def _autoupdate(self):
+        if self.canvas != None:
+            self.canvas._autoupdate()
 
     @property
     def x(self):
@@ -69,6 +70,7 @@ class Object:
         self._x = x
         self.max_x += delta
         self.min_x += delta
+        self._autoupdate()        
 
     @property
     def y(self):
@@ -80,24 +82,29 @@ class Object:
         self._y = y
         self.max_y += delta
         self.min_y += delta
+        self._autoupdate()        
         
     def move(self, x, y):
-        self.x += x
-        self.y += y
+        self._x += x
+        self._y += y
         self.max_x += x
         self.min_x += x
         self.max_y += y
         self.min_y += y
+        self._autoupdate()        
 
     def set_color(self, color):
         for pixel in self.pixels:
             pixel.set_color(color)
+        self._autoupdate()        
             
     def hide(self):
         self.visible = False
+        self._autoupdate()        
         
     def show(self):
         self.visible = True
+        self._autoupdate()        
         
     def check_collision(self, object):
         retval = []
@@ -204,12 +211,13 @@ class Circle(Object):
                         if pixel.x >= 0 and pixel.y >= 0 and (min_y[pixel.x]==None or pixel.y < min_y[pixel.x]):
                             min_y[pixel.x] = pixel.y
                     for _x in range(0, self.r):
-                        for _y in range(min_y[_x]):
+                        for _y in range(min_y[_x]): # type: ignore
                             self.pixels.append(Pixel(_x, _y, self.fill_color, self.brightness))
                             self.pixels.append(Pixel(_x, -_y, self.fill_color, self.brightness))
                             self.pixels.append(Pixel(-_x, _y, self.fill_color, self.brightness))
                             self.pixels.append(Pixel(-_x, -_y, self.fill_color, self.brightness))
-        
+        self._autoupdate()
+
     @property
     def radius(self):
         return self.r
@@ -219,12 +227,13 @@ class Circle(Object):
         self.r = r
         self._calc()
         
-# TODO: Use property setter/getter (width,height), create file function
+# TODO: Use property setter/getter (width,height,fill_color)
 class Rectangle(Object):
-    def __init__(self, x, y, width, height, color=default_color, brightness=default_brightness):
+    def __init__(self, x, y, width, height, color=default_color, brightness=default_brightness, fill_color=None):
         super().__init__(x, y, color, brightness)
         self.width = width
         self.height = height
+        self.fill_color=fill_color
         self._calc()
     
     def _calc(self):
@@ -245,6 +254,10 @@ class Rectangle(Object):
         # right:  [width-1,1], [width-1,2], ..., [width-1,height-2]
         #
         self.pixels.clear()
+        self.min_x = 0
+        self.min_y = 0
+        self.max_x = self.width - 1
+        self.max_y = self.height - 1
         for x in range(self.width):
             # bottom
             self.pixels.append(Pixel(x, 0, self.color, self.brightness))
@@ -255,54 +268,104 @@ class Rectangle(Object):
             self.pixels.append(Pixel(0, y, self.color, self.brightness))
             #right
             self.pixels.append(Pixel(self.width - 1, y, self.color, self.brightness))
+        if self.fill_color != None:
+            for y in range(1, self.height - 1):
+                for x in range(1,self.width-1):
+                    self.pixels.append(Pixel(x, y, self.fill_color, self.brightness))
 
-class GenericShape(Object):
+class SpriteGroup(Object):
+
+    def __init__(self, x, y, shapes, brightness=default_brightness):
+        super().__init__(x, y, "", brightness)
+        x_offset = 0
+        self.max_y = 0
+        for shape in shapes:
+            for pixel in shape.pixels:
+                pixel.x += x_offset
+                self.pixels.append(pixel)
+            x_offset += shape.max_x + 1
+            if shape.max_y > self.max_y:
+                self.max_y = shape.max_y
+        self.min_x = 0
+        self.min_y = 0
+        self.max_x = x_offset
+
+class Sprite(Object):
+
+    def __init__(self, x, y, shape, color_map, brightness=default_brightness):
+        super().__init__(x, y, "", brightness)
+        self.color_map = color_map
+        self.objects = []
+        self.image_index = -1
+        if isinstance(shape, list):
+            for _shape in shape:
+                self.objects.append(self._read_object(_shape))
+        else:
+            self.objects.append(self._read_object(shape))
+        self.next_image()
+
+    def _read_object(self, shape):
+        x = 0
+        y = shape.count('\n') - 2
+        obj = Object(None, None)
+        obj.min_x = 0
+        obj.min_y = 0   
+        obj.max_y = y
+        obj.max_x = 0
+        for pos in range(len(shape)):
+            c = shape[pos]
+            if c == "\n":
+                x = 0
+                y -= 1
+            else:
+                if c != ' ':
+                    obj.pixels.append(Pixel(x, y, self.color_map[c], self.brightness))
+                x += 1
+                if x > obj.max_x:
+                    obj.max_x = x   
+        return obj 
     
-    def __init__(self, x, y, shape_data, color, brightness):
-        super().__init__(x, y, color, brightness)
-        xpos = 0
-        ypos = len(shape_data)-1
-        for line in shape_data:
-            for pixel in line:
-                if pixel == 1:
-                    self.pixels.append(Pixel(xpos, ypos, self.color, self.brightness))
-                xpos+=1
-            ypos-=1
-            xpos=0
+    def next_image(self):
+        self.image_index += 1
+        if self.image_index == len(self.objects):
+            self.image_index = 0
+        self.pixels = self.objects[self.image_index].pixels
+        self.max_x =  self.objects[self.image_index].max_x
+        self.max_y =  self.objects[self.image_index].max_y
+        self._autoupdate()
 
 class Canvas:
-    def __init__(self, height=16, width=16, pin=28):
+    def __init__(self, height=16, width=16, pin=28, autoupdate=False):
         self.objects = []
         self.width = width
         self.height = height
         self.num_pixels = height * width
         self.leds = NeoPixel(Pin(pin, Pin.OUT), self.num_pixels)
-        #self.leds.fill((0,0,0))
-        #self.leds.write()
         self.color_array = [[(0, 0, 0) for i in range(self.height)] for j in range(self.width)]
         self.brightness_array = [[10 for i in range(self.height)] for j in range(self.width)]
+        self.autoupdate = autoupdate
     
-    def check_bounds(self, object):
-        for pixel in object.pixels:
-            x = pixel.x + object.x
-            y = pixel.y + object.y
-            if x >= self.width - 1:
-                return Boundary.RIGHT
-            elif x <= 0:
-                return Boundary.LEFT
-    
+    def _autoupdate(self):
+        if self.autoupdate:
+            self.update()
+
     def add(self, o):
         if isinstance(o, list):
             for object in o:
                 self.objects.append(object)
+                object.canvas = self
         else:
             self.objects.append(o)
+            o.canvas = self
+        self._autoupdate()
 
     def remove(self, object,update=True):
         self.objects.remove(object)
+        self._autoupdate()
 
     def remove_all(self,update=True):
         self.objects.clear()
+        self._autoupdate()
 
     def update(self):
         color_array = [[(0,0,0) for j in range(self.height)] for i in range(self.width)]
@@ -327,16 +390,18 @@ class Canvas:
                     round(color_array[x][y][2] * brightness_array[x][y] / 100))
         self.leds.write()
        
+    #TODO: this should be applied to the shapes 
     def set_brightness(self, brightness):
         for y in range(self.height):
             for x in range(self.width):
                 self.brightness_array[x][y] = brightness
+        self._autoupdate()
         
     def valid_coord(self, x, y):
         return x >= 0 and x < self.width and y >= 0 and y < self.height
         
     # Adapted from https://www.geeksforgeeks.org/flood-fill-algorithm-implement-fill-paint/
-    # TODO: Re-implement
+    # TODO: Re-implement, or get rid of
     def fill(self, xpos, ypos, color, brightness):
       color = get_color_tuple(color)
       # Visiting array
@@ -360,7 +425,7 @@ class Canvas:
         y = coord[1]
         prev_color = self.color_array[x][y]
        
-        self.draw_point(x, y, color, brightness)
+        #self.draw_point(x, y, color, brightness)
         # Popping front pair of queue
         obj.pop(0)
        
